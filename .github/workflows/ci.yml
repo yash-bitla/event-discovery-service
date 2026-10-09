@@ -16,7 +16,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: mypy
-      - run: docker compose up -d --build --wait db
+      - run: docker compose up -d --build --wait db cache
       - run: pytest
 
   compose:

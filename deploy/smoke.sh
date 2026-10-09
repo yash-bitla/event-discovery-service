@@ -16,7 +16,8 @@ for _ in $(seq 1 60); do
         # Make each upstream call fail. The API must continue to answer.
         curl -fsS -X PUT -H 'Content-Type: application/json' \
             -d '{"outages": [[0, 9999999999]]}' "$faults" >/dev/null
-        refreshed
+        # A different limit, so that this answer does not come from the cache.
+        curl -fsS "${url}0" | grep '"id"' | grep -q '"refreshed_at":"2'
         echo "ok: the API answers while the upstream is not available"
         curl -fsS -X PUT -H 'Content-Type: application/json' -d '{}' "$faults" >/dev/null
         exit 0

@@ -15,6 +15,17 @@ services:
       timeout: 2s
       retries: 30
 
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "127.0.0.1:63799:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   # The three services below show the full path: upstream -> ingestion -> database -> API.
   sim:
     build: .
@@ -44,10 +55,12 @@ services:
       - serve
       - --host=0.0.0.0
       - --database-url=postgresql://eds:eds@db:5432/eds
+      - --redis-url=redis://cache:6379/0
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       db: { condition: service_healthy }
+      cache: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz')"]
       interval: 2s
