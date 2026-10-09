@@ -10,6 +10,7 @@ import httpx
 
 from event_discovery.geo import geohash_encode
 from event_discovery.ingest.budget import QuotaBudget, RatePacer
+from event_discovery.ingest.resilience import CircuitBreaker, Retrier
 from event_discovery.models import Event
 
 _QUOTA_VIOLATION = "policies.ratelimit.QuotaViolation"
@@ -28,8 +29,18 @@ class RateLimited(Exception):
 
 
 class UpstreamError(Exception):
+    """The upstream rejected the request (HTTP 4xx). A retry does not help."""
+
     def __init__(self, status_code: int) -> None:
         super().__init__(f"upstream returned HTTP {status_code}")
+        self.status_code = status_code
+
+
+class UpstreamUnavailable(Exception):
+    """The upstream returned HTTP 5xx or did not answer. A retry can help."""
+
+    def __init__(self, status_code: int | None, reason: str) -> None:
+        super().__init__(reason)
         self.status_code = status_code
 
 
@@ -43,9 +54,10 @@ class Page:
 
 
 class DiscoveryClient:
-    """Every call goes through the budget and then the pacer.
+    """Each attempt goes through the breaker, the budget and the pacer, in that order.
 
-    With `budget=None` the client does not check a budget before it sends a call.
+    A retry is an attempt, so a retry also uses the budget. With `budget=None` the
+    client does not check a budget. With `retrier=None` it does not retry.
     """
 
     def __init__(
@@ -54,11 +66,16 @@ class DiscoveryClient:
         api_key: str,
         pacer: RatePacer,
         budget: QuotaBudget | None = None,
+        *,
+        retrier: Retrier | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> None:
         self._http = http
         self._api_key = api_key
         self._pacer = pacer
         self._budget = budget
+        self._retrier = retrier
+        self._breaker = breaker
         self.calls = 0
 
     def search(
@@ -72,25 +89,47 @@ class DiscoveryClient:
         page: int = 0,
         size: int = 200,
     ) -> Page:
+        params: dict[str, str | int] = {
+            "apikey": self._api_key,
+            "geoPoint": geohash_encode(lat, lon),
+            "radius": radius_km,
+            "unit": "km",
+            "startDateTime": _format_datetime(start),
+            "endDateTime": _format_datetime(end),
+            "sort": "date,asc",
+            "size": size,
+            "page": page,
+        }
+        failed_attempts = 0
+        while True:
+            try:
+                return self._attempt(params)
+            except (UpstreamUnavailable, RateLimited):
+                failed_attempts += 1
+                if self._retrier is None or failed_attempts >= self._retrier.max_attempts:
+                    raise
+                self._retrier.wait(failed_attempts)
+
+    def _attempt(self, params: dict[str, str | int]) -> Page:
+        if self._breaker is not None:
+            self._breaker.before_call()
         if self._budget is not None and not self._budget.try_spend():
             raise BudgetExhausted
         self._pacer.wait()
         self.calls += 1
-        response = self._http.get(
-            "/discovery/v2/events.json",
-            params={
-                "apikey": self._api_key,
-                "geoPoint": geohash_encode(lat, lon),
-                "radius": radius_km,
-                "unit": "km",
-                "startDateTime": _format_datetime(start),
-                "endDateTime": _format_datetime(end),
-                "sort": "date,asc",
-                "size": size,
-                "page": page,
-            },
-        )
+        try:
+            response = self._http.get("/discovery/v2/events.json", params=params)
+        except httpx.TransportError as error:
+            self._record(healthy=False)
+            raise UpstreamUnavailable(None, type(error).__name__) from error
         self._observe(response)
+        if response.status_code >= 500:
+            self._record(healthy=False)
+            raise UpstreamUnavailable(
+                response.status_code, f"upstream returned HTTP {response.status_code}"
+            )
+        # All other responses show that the upstream is in operation.
+        self._record(healthy=True)
         if response.status_code == 429:
             if _error_code(response) == _QUOTA_VIOLATION:
                 raise QuotaExceeded
@@ -98,6 +137,14 @@ class DiscoveryClient:
         if response.status_code != 200:
             raise UpstreamError(response.status_code)
         return parse_page(response.json())
+
+    def _record(self, *, healthy: bool) -> None:
+        if self._breaker is None:
+            return
+        if healthy:
+            self._breaker.record_success()
+        else:
+            self._breaker.record_failure()
 
     def _observe(self, response: httpx.Response) -> None:
         if self._budget is None:
