@@ -10,21 +10,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from psycopg_pool import ConnectionPool
 
+from event_discovery.api.cache import ResponseCache, SingleFlight, cache_key
 from event_discovery.storage.events import EventHit, SearchQuery, search_events
 from event_discovery.storage.regions import last_refresh
 
 MAX_RADIUS_KM = 200
 MAX_LIMIT = 200
 DEFAULT_RANGE = timedelta(days=30)
+COORDINATE_DECIMALS = 4
 
 
 def create_api(
-    pool: ConnectionPool, now: Callable[[], datetime] = lambda: datetime.now(UTC)
+    pool: ConnectionPool,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    cache: ResponseCache | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Event discovery", docs_url=None, redoc_url=None)
+    flights = SingleFlight()
 
     @app.get("/events")
     def get_events(
@@ -36,38 +41,59 @@ def create_api(
         segment: str | None = None,
         limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
         cursor: str | None = None,
-    ) -> dict[str, Any]:
-        range_start = _as_utc(start) if start else now()
+    ) -> Response:
+        # Requests that differ by less than these steps get the same answer, so
+        # they can use the same cache entry. Four decimals are approximately 11 m.
+        lat, lon = round(lat, COORDINATE_DECIMALS), round(lon, COORDINATE_DECIMALS)
+        range_start = _as_utc(start) if start else now().replace(second=0, microsecond=0)
         range_end = _as_utc(end) if end else range_start + DEFAULT_RANGE
         if range_end <= range_start:
             raise HTTPException(422, "end must be after start")
-        # One more row than the limit shows if a next page exists.
-        hits = search_events(
-            pool,
-            SearchQuery(
-                lat=lat,
-                lon=lon,
-                radius_km=radius_km,
-                start=range_start,
-                end=range_end,
-                segment=segment,
-                limit=limit + 1,
-                after=_decode_cursor(cursor) if cursor else None,
-            ),
-        )
-        page = hits[:limit]
-        next_cursor = None
-        if len(hits) > limit:
-            last = page[-1].event
-            next_cursor = _encode_cursor(last.starts_at, last.id)
-        # The API reads only the database, so it answers also when the upstream is
-        # not available. `refreshed_at` tells the client the age of the data.
-        refreshed_at = last_refresh(pool, lat, lon)
-        return {
-            "events": [_to_json(hit) for hit in page],
-            "next_cursor": next_cursor,
-            "refreshed_at": _format(refreshed_at) if refreshed_at else None,
-        }
+        after = _decode_cursor(cursor) if cursor else None
+
+        def compute() -> bytes:
+            # One more row than the limit shows if a next page exists.
+            hits = search_events(
+                pool,
+                SearchQuery(
+                    lat=lat,
+                    lon=lon,
+                    radius_km=radius_km,
+                    start=range_start,
+                    end=range_end,
+                    segment=segment,
+                    limit=limit + 1,
+                    after=after,
+                ),
+            )
+            page = hits[:limit]
+            next_cursor = None
+            if len(hits) > limit:
+                last = page[-1].event
+                next_cursor = _encode_cursor(last.starts_at, last.id)
+            # The API reads only the database, so it answers also when the upstream
+            # is not available. `refreshed_at` tells the client the age of the data.
+            refreshed_at = last_refresh(pool, lat, lon)
+            body = {
+                "events": [_to_json(hit) for hit in page],
+                "next_cursor": next_cursor,
+                "refreshed_at": _format(refreshed_at) if refreshed_at else None,
+            }
+            return json.dumps(body, separators=(",", ":")).encode()
+
+        if cache is None:
+            return _json(compute(), "off")
+        key = cache_key(lat, lon, radius_km, range_start, range_end, segment, limit, after)
+        cached = cache.get(key)
+        if cached is not None:
+            return _json(cached, "hit")
+
+        def compute_and_store() -> bytes:
+            body = compute()
+            cache.set(key, body)
+            return body
+
+        return _json(flights.do(key, compute_and_store), "miss")
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
@@ -79,6 +105,10 @@ def create_api(
         return JSONResponse({"status": "ok"})
 
     return app
+
+
+def _json(body: bytes, cache_state: str) -> Response:
+    return Response(body, media_type="application/json", headers={"X-Cache": cache_state})
 
 
 def _to_json(hit: EventHit) -> dict[str, Any]:

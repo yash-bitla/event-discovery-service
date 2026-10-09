@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import uvicorn
 
-from event_discovery.api.app import create_api
 from event_discovery.clock import SystemClock
 from event_discovery.ingest.budget import QuotaBudget, RatePacer
 from event_discovery.ingest.client import DiscoveryClient
@@ -48,6 +48,7 @@ def main() -> None:
     ingest.add_argument("--api-key", default="demo")
     ingest.add_argument("--regions", type=Path, default=Path("config/regions.toml"))
     ingest.add_argument("--database-url", help="store the events here; default: in memory")
+    ingest.add_argument("--schema", help="database schema of the tables; default: public")
     ingest.add_argument("--cycles", type=int, default=1, help="0: run until stopped")
     ingest.add_argument("--interval", type=float, default=3600, help="seconds between cycles")
     ingest.add_argument("--quota", type=int, default=5000)
@@ -56,6 +57,10 @@ def main() -> None:
 
     serve = commands.add_parser("serve", help="start the query API")
     serve.add_argument("--database-url", required=True)
+    serve.add_argument("--schema", help="database schema of the tables; default: public")
+    serve.add_argument("--redis-url", help="cache the responses here; default: no cache")
+    serve.add_argument("--cache-ttl", type=int, default=60, help="seconds")
+    serve.add_argument("--workers", type=int, default=1, help="API processes")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
 
@@ -84,22 +89,34 @@ def _run_sim(args: argparse.Namespace) -> None:
 
 
 def _run_serve(args: argparse.Namespace) -> None:
-    pool = open_pool(args.database_url)
-    migrate(pool)
-    try:
-        uvicorn.run(create_api(pool), host=args.host, port=args.port, log_level="warning")
-    finally:
-        pool.close()
+    pool = open_pool(args.database_url, schema=args.schema, max_size=1)
+    migrate(pool, schema=args.schema)
+    pool.close()
+    # Each worker process makes its own app from this environment.
+    os.environ["EDS_DATABASE_URL"] = args.database_url
+    os.environ["EDS_SCHEMA"] = args.schema or ""
+    os.environ["EDS_POOL_SIZE"] = str(max(4, 40 // args.workers))
+    os.environ["EDS_CACHE_TTL"] = str(args.cache_ttl)
+    if args.redis_url:
+        os.environ["EDS_REDIS_URL"] = args.redis_url
+    uvicorn.run(
+        "event_discovery.api.asgi:create",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        log_level="warning",
+    )
 
 
 def _run_ingest(args: argparse.Namespace) -> None:
     clock = SystemClock()
     budget = QuotaBudget(clock, daily_limit=args.quota, reserve=args.reserve)
-    pool = open_pool(args.database_url) if args.database_url else None
+    pool = open_pool(args.database_url, schema=args.schema) if args.database_url else None
     sink: EventSink = InMemorySink()
     state_store: StateStore | None = None
     if pool is not None:
-        migrate(pool)
+        migrate(pool, schema=args.schema)
         sink = PostgresSink(pool)
         state_store = PostgresStateStore(pool)
     breaker = CircuitBreaker(clock)
