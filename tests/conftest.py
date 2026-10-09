@@ -55,5 +55,5 @@ def _pool() -> Iterator[ConnectionPool]:
 @pytest.fixture
 def pool(_pool: ConnectionPool) -> ConnectionPool:
     with _pool.connection() as conn:
-        conn.execute("TRUNCATE events")
+        conn.execute("TRUNCATE events, region_state")
     return _pool
