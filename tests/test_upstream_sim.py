@@ -93,6 +93,7 @@ def test_quota_rejects_calls_until_the_reset(events: list[SimEvent], clock: Manu
         "accepted": 4,
         "rejected_quota": 1,
         "rejected_spike": 0,
+        "faults_injected": 0,
     }
 
 
@@ -111,3 +112,51 @@ def test_the_sixth_call_in_one_second_is_rejected_and_uses_no_quota(
 
     clock.sleep(1)
     assert sim.get("/discovery/v2/events.json", params=ny_params()).status_code == 200
+
+
+def test_an_outage_returns_503_and_uses_the_quota(
+    events: list[SimEvent], clock: ManualClock
+) -> None:
+    sim = make_sim(events, clock, daily_quota=10)
+    now = clock.now()
+    plan = sim.put("/_sim/faults", json={"outages": [[now + 10, now + 20]]})
+    assert plan.status_code == 200
+
+    assert sim.get("/discovery/v2/events.json", params=ny_params()).status_code == 200
+    clock.sleep(10)
+    failed = sim.get("/discovery/v2/events.json", params=ny_params())
+    assert failed.status_code == 503
+    assert failed.headers["Rate-Limit-Available"] == "8"
+    clock.sleep(10)
+    assert sim.get("/discovery/v2/events.json", params=ny_params()).status_code == 200
+    assert sim.get("/_sim/stats").json()["faults_injected"] == 1
+
+
+def test_an_error_rate_fails_that_share_of_the_calls(
+    events: list[SimEvent], clock: ManualClock
+) -> None:
+    sim = make_sim(events, clock)
+    sim.put("/_sim/faults", json={"error_rate": 0.25})
+    statuses = []
+    for _ in range(400):
+        clock.sleep(1)
+        statuses.append(sim.get("/discovery/v2/events.json", params=ny_params(size=1)).status_code)
+    assert set(statuses) == {200, 503}
+    assert 70 <= statuses.count(503) <= 130  # 25 % of 400 is 100
+
+    sim.put("/_sim/faults", json={})
+    clock.sleep(1)
+    assert sim.get("/discovery/v2/events.json", params=ny_params()).status_code == 200
+
+
+def test_latency_delays_the_response(events: list[SimEvent], clock: ManualClock) -> None:
+    sim = make_sim(events, clock)
+    sim.put("/_sim/faults", json={"latency_s": 2.5})
+    before = clock.now()
+    sim.get("/discovery/v2/events.json", params=ny_params())
+    assert clock.now() - before == 2.5
+
+
+def test_an_invalid_fault_plan_gets_422(events: list[SimEvent], clock: ManualClock) -> None:
+    sim = make_sim(events, clock)
+    assert sim.put("/_sim/faults", json={"error_rate": 2}).status_code == 422
