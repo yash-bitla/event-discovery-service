@@ -3,9 +3,60 @@
 A backend service that answers one question: which events are near a location in a
 date range? It gets its events from an API that has a daily quota and a rate limit.
 
-The project is in progress. Milestones 1 to 3 of 5 are complete: ingestion that
-stays in the quota, storage with a search API, and behavior during upstream
-failures.
+The project is in progress. Milestones 1 to 4 of 5 are complete: ingestion that
+stays in the quota, storage with a search API, behavior during upstream
+failures, and a cache with a load test.
+
+## Result of milestone 4: load test and cache
+
+Requests arrive at a fixed rate for 60 seconds, after 60 seconds of warm-up.
+The database has 1,000,000 events.
+
+| Requests/s | Cache | Successful/s | P50 (ms) | P95 (ms) | P99 (ms) | Errors | Cache hit rate |
+|---|---|---|---|---|---|---|---|
+| 400 | no | 400 | 8.2 | 23.9 | 38.8 | 0 | - |
+| 400 | yes | 400 | 3.0 | 9.6 | 15.3 | 0 | 83.3 % |
+| 800 | no | 595 | 877.0 | 3572.6 | 3762.9 | 12,314 | - |
+| 800 | yes | 800 | 2.5 | 10.5 | 17.8 | 0 | 86.1 % |
+| 1200 | no | 595 | 845.1 | 3533.6 | 3899.7 | 36,280 | - |
+| 1200 | yes | 1200 | 2.6 | 11.5 | 20.7 | 0 | 87.3 % |
+
+- Without the cache, the service has a limit of approximately 600 requests a
+  second. At 800 requests a second, 12,314 of 48,000 requests fail (26 %).
+- With the cache, 1200 requests a second have a P95 of 11.5 ms and no errors.
+  That is the highest rate in the test, so the test did not find the limit with
+  the cache.
+- At a rate that the two configurations can serve (400 requests a second), the
+  cache decreases the P95 from 23.9 ms to 9.6 ms.
+
+**An upstream outage during the load.** Ingestion runs against the simulated
+upstream, and the upstream fails each call for the middle 30 seconds of the run.
+The API gets 200 requests a second:
+
+| Phase | Successful/s | P50 (ms) | P95 (ms) | Errors |
+|---|---|---|---|---|
+| Before the outage | 200 | 3.9 | 13.4 | 0 |
+| During the outage | 200 | 4.1 | 11.6 | 0 |
+| After the outage | 200 | 4.0 | 11.9 | 0 |
+
+The clients see no error and no slower response. The API reads only the database
+and the cache, so an upstream failure does not reach it. In this run, 5 calls of
+ingestion failed before the circuit breaker opened.
+
+Conditions: the API runs as 4 processes on an Apple M3 Pro. PostgreSQL and Redis
+run in a Docker virtual machine with 2 CPUs and 2 GB of memory on the same
+computer, and the load generator also runs there. 90 % of the requests come
+from 2000 popular searches with a Zipf distribution, and 10 % are searches that
+occur one time. The cache hit rate is a property of this workload: a workload
+with fewer repeated searches gets a lower rate. The load is open-loop, and a
+request that gets no response in 5 seconds is an error.
+
+To get the same tables (approximately 20 minutes):
+
+```
+docker compose up -d db cache
+python benchmarks/load_test.py --rates 200,400,800,1200
+```
 
 ## Result of milestone 3: upstream failures
 
@@ -195,6 +246,25 @@ the point). The cursor holds the start time and the id of the last
 event, so a page does not change when new events arrive before it.
 `GET /healthz` reports if the database answers.
 
+### The cache
+
+The API keeps each response in Redis for 60 seconds. The `X-Cache` response
+header is `hit`, `miss` or `off`.
+
+- **Key.** The API rounds `lat` and `lon` to 4 decimals (approximately 11 m) and
+  a default `start` to the minute, before the search. Requests that differ by
+  less than that get the same answer and use the same cache entry.
+- **Age.** A response from the cache can be 60 seconds old. Ingestion refreshes a
+  region 9 times a day on average (270 refreshes ÷ 30 regions), so this adds
+  little to the age of the data.
+- **One computation for each key.** When a popular entry expires, many requests
+  miss at the same moment. One of them reads the database, and the others in the
+  same process wait for its result.
+- **Redis failure.** If Redis does not answer in 0.1 seconds, the request reads the
+  database. The API then does not try Redis for 5 seconds. The Redis client has
+  no retries: its default of 3 retries held a request for more than 2 seconds
+  in a test.
+
 ## The simulated upstream
 
 `event_discovery.upstream_sim` is a local copy of the event search of the
@@ -223,12 +293,12 @@ Python 3.12 or later and Docker are necessary.
 ```
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-docker compose up -d db                # PostgreSQL with PostGIS, for the tests
+docker compose up -d db cache          # PostgreSQL with PostGIS, and Redis, for the tests
 .venv/bin/pytest
 ```
 
-To start all the parts (the simulated upstream, ingestion, the database and the
-API) and then search:
+To start all the parts (the simulated upstream, ingestion, the database, the cache
+and the API) and then search:
 
 ```
 docker compose up -d --build --wait
@@ -242,8 +312,8 @@ The first ingestion cycle needs approximately 30 seconds to get all regions.
 1. **Done.** Ingestion with a quota budget, and the simulated upstream.
 2. **Done.** Storage in PostgreSQL, a geospatial index, and the query API.
 3. **Done.** Retries, a circuit breaker, and fault-injection tests.
-4. A cache and a load test: P95 latency, cache hit rate, and behavior during an
-   upstream failure.
+4. **Done.** A cache and a load test: P95 latency, cache hit rate, and behavior
+   during an upstream failure.
 5. Final results and a write-up.
 
 Known limits at this point: the service does not delete events that are in the
