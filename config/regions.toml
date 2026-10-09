@@ -1,0 +1,211 @@
+# Regions that ingestion keeps fresh. `weight` is the relative demand for the region.
+
+[[region]]
+name = "New York"
+lat = 40.7128
+lon = -74.006
+radius_km = 50
+weight = 19.5
+
+[[region]]
+name = "Los Angeles"
+lat = 34.0522
+lon = -118.2437
+radius_km = 50
+weight = 12.9
+
+[[region]]
+name = "Chicago"
+lat = 41.8781
+lon = -87.6298
+radius_km = 50
+weight = 9.3
+
+[[region]]
+name = "Dallas"
+lat = 32.7767
+lon = -96.797
+radius_km = 50
+weight = 8.1
+
+[[region]]
+name = "Houston"
+lat = 29.7604
+lon = -95.3698
+radius_km = 50
+weight = 7.5
+
+[[region]]
+name = "Washington"
+lat = 38.9072
+lon = -77.0369
+radius_km = 50
+weight = 6.3
+
+[[region]]
+name = "Atlanta"
+lat = 33.749
+lon = -84.388
+radius_km = 50
+weight = 6.3
+
+[[region]]
+name = "Philadelphia"
+lat = 39.9526
+lon = -75.1652
+radius_km = 50
+weight = 6.2
+
+[[region]]
+name = "Miami"
+lat = 25.7617
+lon = -80.1918
+radius_km = 50
+weight = 6.2
+
+[[region]]
+name = "Phoenix"
+lat = 33.4484
+lon = -112.074
+radius_km = 50
+weight = 5.1
+
+[[region]]
+name = "Boston"
+lat = 42.3601
+lon = -71.0589
+radius_km = 50
+weight = 4.9
+
+[[region]]
+name = "San Francisco"
+lat = 37.7749
+lon = -122.4194
+radius_km = 50
+weight = 4.6
+
+[[region]]
+name = "Detroit"
+lat = 42.3314
+lon = -83.0458
+radius_km = 50
+weight = 4.3
+
+[[region]]
+name = "Seattle"
+lat = 47.6062
+lon = -122.3321
+radius_km = 50
+weight = 4.0
+
+[[region]]
+name = "Minneapolis"
+lat = 44.9778
+lon = -93.265
+radius_km = 50
+weight = 3.7
+
+[[region]]
+name = "San Diego"
+lat = 32.7157
+lon = -117.1611
+radius_km = 50
+weight = 3.3
+
+[[region]]
+name = "Tampa"
+lat = 27.9506
+lon = -82.4572
+radius_km = 50
+weight = 3.3
+
+[[region]]
+name = "Denver"
+lat = 39.7392
+lon = -104.9903
+radius_km = 50
+weight = 3.0
+
+[[region]]
+name = "St. Louis"
+lat = 38.627
+lon = -90.1994
+radius_km = 50
+weight = 2.8
+
+[[region]]
+name = "Charlotte"
+lat = 35.2271
+lon = -80.8431
+radius_km = 50
+weight = 2.8
+
+[[region]]
+name = "Orlando"
+lat = 28.5383
+lon = -81.3792
+radius_km = 50
+weight = 2.8
+
+[[region]]
+name = "San Antonio"
+lat = 29.4241
+lon = -98.4936
+radius_km = 50
+weight = 2.7
+
+[[region]]
+name = "Portland"
+lat = 45.5152
+lon = -122.6784
+radius_km = 50
+weight = 2.5
+
+[[region]]
+name = "Pittsburgh"
+lat = 40.4406
+lon = -79.9959
+radius_km = 50
+weight = 2.4
+
+[[region]]
+name = "Austin"
+lat = 30.2672
+lon = -97.7431
+radius_km = 50
+weight = 2.4
+
+[[region]]
+name = "Las Vegas"
+lat = 36.1699
+lon = -115.1398
+radius_km = 50
+weight = 2.3
+
+[[region]]
+name = "Kansas City"
+lat = 39.0997
+lon = -94.5786
+radius_km = 50
+weight = 2.2
+
+[[region]]
+name = "Nashville"
+lat = 36.1627
+lon = -86.7816
+radius_km = 50
+weight = 2.1
+
+[[region]]
+name = "Salt Lake City"
+lat = 40.7608
+lon = -111.891
+radius_km = 50
+weight = 1.3
+
+[[region]]
+name = "New Orleans"
+lat = 29.9511
+lon = -90.0715
+radius_km = 50
+weight = 1.2
