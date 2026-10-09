@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from psycopg_pool import ConnectionPool
 
@@ -17,6 +18,7 @@ from event_discovery.upstream_sim.dataset import SimEvent, generate_events
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 DATABASE_URL = os.environ.get("EDS_TEST_DATABASE_URL", "postgresql://eds:eds@127.0.0.1:54329/eds")
 TEST_SCHEMA = "eds_test"
+REDIS_URL = os.environ.get("EDS_TEST_REDIS_URL", "redis://127.0.0.1:63799/15")
 
 
 @pytest.fixture
@@ -57,3 +59,17 @@ def pool(_pool: ConnectionPool) -> ConnectionPool:
     with _pool.connection() as conn:
         conn.execute("TRUNCATE events, region_state")
     return _pool
+
+
+@pytest.fixture
+def redis_client() -> Iterator[redis.Redis]:
+    """An empty Redis database. Start it with `docker compose up -d cache`."""
+    client = redis.Redis.from_url(REDIS_URL, socket_timeout=1, socket_connect_timeout=1)
+    try:
+        client.flushdb()
+    except redis.RedisError:
+        if os.environ.get("CI"):
+            raise
+        pytest.skip("the test Redis is not available")
+    yield client
+    client.close()
