@@ -16,4 +16,11 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: mypy
+      - run: docker compose up -d --build --wait db
       - run: pytest
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: deploy/smoke.sh
