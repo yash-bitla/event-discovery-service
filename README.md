@@ -3,10 +3,44 @@
 A backend service that answers one question: which events are near a location in a
 date range? It gets its events from an API that has a daily quota and a rate limit.
 
-The project is in progress. Milestone 1 of 5 is complete: ingestion that stays in
-the quota.
+The project is in progress. Milestones 1 and 2 of 5 are complete: ingestion that
+stays in the quota, and storage with a search API.
 
-## Result of milestone 1
+## Result of milestone 2: search in PostgreSQL
+
+The search is "events less than N km from a point, with a start time in a range".
+One GiST index on `(location, starts_at)` answers it. I measured that index and four
+alternatives on 1,000,000 events with the same 500 searches:
+
+| Indexes | P50 (ms) | P95 (ms) | P99 (ms) |
+|---|---|---|---|
+| No index | 178.35 | 209.20 | 229.44 |
+| B-tree on `starts_at` | 74.35 | 106.41 | 115.58 |
+| GiST on `location` | 26.04 | 73.90 | 82.02 |
+| GiST on `location` + B-tree on `starts_at` | 5.91 | 22.66 | 38.89 |
+| **GiST on `(location, starts_at)`, the index of the service** | **2.57** | **17.06** | **25.37** |
+
+- The index of the service is 69 times faster than no index at P50
+  (178.35 ÷ 2.57) and 12 times faster at P95 (209.20 ÷ 17.06).
+- An index on only the location or only the time is not sufficient. Each search
+  has the two conditions, and the combined index applies them in one index scan.
+
+Conditions: the time is for one search from a Python client on one connection,
+with the network time to a local container. Each search has a radius of 5, 10 or
+25 km, a range of 1, 3 or 7 days, and a limit of 50 rows. PostgreSQL 17 with
+PostGIS 3.6 and the default settings, in a Docker virtual machine with 2 CPUs and
+2 GB of memory, on an Apple M3 Pro. The events have 40 venues for each of 30
+cities, so many events have the same location. The benchmark does not measure
+the cost of the index for writes.
+
+To get the same table:
+
+```
+docker compose up -d db
+python benchmarks/geo_query.py
+```
+
+## Result of milestone 1: ingestion that stays in the quota
 
 The upstream permits 5000 calls a day. One refresh of all 30 regions uses
 approximately 550 calls, so a refresh of all regions each hour needs 13,200 calls
@@ -71,6 +105,32 @@ The upstream returns no item after the first 1000 of a search (`size × page < 1
 If a region has more events than that, the worker divides the date range into two
 halves and gets each half.
 
+## Storage and the query API
+
+The events are in one PostgreSQL table. The location is a PostGIS `geography`
+point, so a distance is in meters on the WGS 84 spheroid. The worker writes a page
+of events with one statement. That statement inserts new events, updates changed
+events, and does not write a row that is the same.
+
+```
+GET /events?lat=40.7128&lon=-74.0060&radius_km=10&start=2026-01-10T00:00:00Z&end=2026-01-12T00:00:00Z
+```
+
+| Parameter | Default | Limit |
+|---|---|---|
+| `lat`, `lon` | necessary | |
+| `radius_km` | 10 | 200 |
+| `start` | now | |
+| `end` | `start` + 30 days | |
+| `segment` | all | |
+| `limit` | 50 | 200 |
+| `cursor` | first page | |
+
+The response has the events in order of start time, the distance of each event in
+km, and `next_cursor`. The cursor holds the start time and the id of the last
+event, so a page does not change when new events arrive before it.
+`GET /healthz` reports if the database answers.
+
 ## The simulated upstream
 
 `event_discovery.upstream_sim` is a local copy of the event search of the
@@ -91,27 +151,37 @@ the quota.
 
 ## Quick start
 
-Python 3.12 or later is necessary.
+Python 3.12 or later and Docker are necessary.
 
 ```
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+docker compose up -d db                # PostgreSQL with PostGIS, for the tests
 .venv/bin/pytest
-
-.venv/bin/eds sim --events 3000        # terminal 1: the simulated upstream on port 8081
-.venv/bin/eds ingest                   # terminal 2: one ingestion cycle
 ```
+
+To start all the parts (the simulated upstream, ingestion, the database and the
+API) and then search:
+
+```
+docker compose up -d --build --wait
+curl 'http://127.0.0.1:8080/events?lat=40.7128&lon=-74.0060&radius_km=10'
+```
+
+The first ingestion cycle needs approximately 30 seconds to get all regions.
 
 ## Milestones
 
 1. **Done.** Ingestion with a quota budget, and the simulated upstream.
-2. Storage, a geospatial index, and the query API.
+2. **Done.** Storage in PostgreSQL, a geospatial index, and the query API.
 3. Retries, a circuit breaker, and fault-injection tests.
 4. A cache and a load test: P95 latency, cache hit rate, and behavior during an
    upstream failure.
 5. Final results and a write-up.
 
-In milestone 1 the events go to memory. Storage is the subject of milestone 2.
+Known limits at this point: the worker keeps the refresh time of each region in
+memory, so a restart starts a full refresh. The service does not delete events
+that are in the past.
 
 ## License
 
