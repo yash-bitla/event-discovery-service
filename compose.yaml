@@ -19,6 +19,8 @@ services:
   sim:
     build: .
     command: ["sim", "--host", "0.0.0.0", "--events", "20000"]
+    ports:
+      - "127.0.0.1:8081:8081"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8081/_sim/stats')"]
       interval: 2s
