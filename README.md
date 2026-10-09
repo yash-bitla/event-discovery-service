@@ -3,8 +3,59 @@
 A backend service that answers one question: which events are near a location in a
 date range? It gets its events from an API that has a daily quota and a rate limit.
 
-The project is in progress. Milestones 1 and 2 of 5 are complete: ingestion that
-stays in the quota, and storage with a search API.
+The project is in progress. Milestones 1 to 3 of 5 are complete: ingestion that
+stays in the quota, storage with a search API, and behavior during upstream
+failures.
+
+## Result of milestone 3: upstream failures
+
+The simulated upstream can fail on command. The same day of hourly ingestion ran
+with three clients. All three use the quota budget.
+
+**One call in five fails (HTTP 503) for the full day:**
+
+| Client | Calls | Failed calls | Region refreshes | Failed refreshes | Mean staleness (h) | Max staleness (h) |
+|---|---|---|---|---|---|---|
+| No retry | 3152 | 659 | 59 | 659 | 10.16 | 24.00 |
+| Retry | 4482 | 947 | 205 | 5 | 2.07 | 5.99 |
+| Retry + circuit breaker | 4482 | 947 | 205 | 5 | 2.07 | 5.99 |
+
+- Without retries, ingestion almost stops. One failed call fails the refresh of
+  its region, and a refresh needs 17 calls on average (4499 calls ÷ 270 refreshes
+  in milestone 1). For a region that needs 17 calls, the chance that all are
+  successful is 0.8^17 = 2.3 %.
+- With a maximum of 4 attempts for each call, 205 refreshes are successful and 5
+  fail. The retries go through the quota budget, so the day stays in the quota.
+- The breaker did not open (0 times). That is correct: it opens after 5 failures
+  in sequence, and it must not stop ingestion for errors that are not in sequence.
+
+**A full outage that starts at 06:20 and continues for approximately 2 hours**
+(mean of four runs, with the end at 08:05, 08:20, 08:35 and 08:50):
+
+| Client | Failed calls | Recovery, mean (min) | Recovery, max (min) | Mean staleness (h) |
+|---|---|---|---|---|
+| No retry | 21 | 33.3 | 55.8 | 1.68 |
+| Retry | 84 | 33.3 | 55.8 | 1.70 |
+| Retry + circuit breaker | 24 | 3.3 | 3.3 | 1.62 |
+
+- Recovery is the time from the end of the outage to the first refresh. Without
+  the breaker, ingestion waits for the next hourly cycle. With the breaker, the
+  next cycle starts at the next probe, and the breaker sends a probe at least
+  each 5 minutes.
+- Retries alone make an outage cost more quota: 84 failed calls. The breaker
+  decreases that to 24, which includes the probes.
+- The staleness for the day is almost the same for the three clients. No client
+  can refresh during an outage.
+
+During an outage the query API continues to answer, because it reads only the
+database. Each response has a `refreshed_at` field, so a client can see the age
+of the data. A test and the CI smoke test check this.
+
+To get the same tables (approximately 4 minutes):
+
+```
+python benchmarks/fault_day.py
+```
 
 ## Result of milestone 2: search in PostgreSQL
 
@@ -101,6 +152,18 @@ and each run gives the same numbers.
    to spend, the client does not send the request.
 5. **Pace.** The client sends a maximum of 4 calls a second. The upstream limit is 5.
 
+## How ingestion handles failures
+
+- **Retry.** After HTTP 5xx, a network error, or a rate-limit rejection, the client
+  tries again: a maximum of 4 attempts, with exponential backoff and full jitter.
+  It does not retry HTTP 4xx or a used quota. Each attempt uses the quota budget.
+- **Circuit breaker.** After 5 failures in sequence, the breaker opens and the
+  client sends no calls. After 30 seconds, one probe goes through. A successful
+  probe closes the breaker. A failed probe opens it again for two times as long,
+  to a maximum of 5 minutes. Each probe uses one call of the quota.
+- **Saved state.** The worker saves the refresh time and the cost of each region
+  in the database. After a restart it continues from that state.
+
 The upstream returns no item after the first 1000 of a search (`size × page < 1000`).
 If a region has more events than that, the worker divides the date range into two
 halves and gets each half.
@@ -127,7 +190,8 @@ GET /events?lat=40.7128&lon=-74.0060&radius_km=10&start=2026-01-10T00:00:00Z&end
 | `cursor` | first page | |
 
 The response has the events in order of start time, the distance of each event in
-km, and `next_cursor`. The cursor holds the start time and the id of the last
+km, `next_cursor`, and `refreshed_at` (the last refresh of a region that contains
+the point). The cursor holds the start time and the id of the last
 event, so a page does not change when new events arrive before it.
 `GET /healthz` reports if the database answers.
 
@@ -143,11 +207,14 @@ It copies the limits that Ticketmaster documents:
 - HTTP 429 with the documented fault body when the quota is used
 - the deep paging limit
 
+`PUT /_sim/faults` makes it fail on command: an error rate, an outage between two
+times, or a delay before each response.
+
 The events are synthetic, and a seed makes them the same on each run. No API key and
-no network are necessary. Three points are my decisions, because the Ticketmaster
+no network are necessary. Four points are my decisions, because the Ticketmaster
 documents do not specify them: the quota resets at 00:00 UTC, the rate limit is a
-sliding window of one second, and a call that the rate limit rejects does not use
-the quota.
+sliding window of one second, a call that the rate limit rejects does not use the
+quota, and a call that fails with HTTP 503 does use the quota.
 
 ## Quick start
 
@@ -174,14 +241,13 @@ The first ingestion cycle needs approximately 30 seconds to get all regions.
 
 1. **Done.** Ingestion with a quota budget, and the simulated upstream.
 2. **Done.** Storage in PostgreSQL, a geospatial index, and the query API.
-3. Retries, a circuit breaker, and fault-injection tests.
+3. **Done.** Retries, a circuit breaker, and fault-injection tests.
 4. A cache and a load test: P95 latency, cache hit rate, and behavior during an
    upstream failure.
 5. Final results and a write-up.
 
-Known limits at this point: the worker keeps the refresh time of each region in
-memory, so a restart starts a full refresh. The service does not delete events
-that are in the past.
+Known limits at this point: the service does not delete events that are in the
+past. The breaker state is in the memory of the worker, so the API cannot report it.
 
 ## License
 

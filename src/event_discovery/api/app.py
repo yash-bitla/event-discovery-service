@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
 from event_discovery.storage.events import EventHit, SearchQuery, search_events
+from event_discovery.storage.regions import last_refresh
 
 MAX_RADIUS_KM = 200
 MAX_LIMIT = 200
@@ -59,7 +60,14 @@ def create_api(
         if len(hits) > limit:
             last = page[-1].event
             next_cursor = _encode_cursor(last.starts_at, last.id)
-        return {"events": [_to_json(hit) for hit in page], "next_cursor": next_cursor}
+        # The API reads only the database, so it answers also when the upstream is
+        # not available. `refreshed_at` tells the client the age of the data.
+        refreshed_at = last_refresh(pool, lat, lon)
+        return {
+            "events": [_to_json(hit) for hit in page],
+            "next_cursor": next_cursor,
+            "refreshed_at": _format(refreshed_at) if refreshed_at else None,
+        }
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
@@ -75,9 +83,13 @@ def create_api(
 
 def _to_json(hit: EventHit) -> dict[str, Any]:
     body = asdict(hit.event)
-    body["starts_at"] = hit.event.starts_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body["starts_at"] = _format(hit.event.starts_at)
     body["distance_km"] = round(hit.distance_km, 3)
     return body
+
+
+def _format(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _as_utc(value: datetime) -> datetime:

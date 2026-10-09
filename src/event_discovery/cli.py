@@ -15,9 +15,17 @@ from event_discovery.clock import SystemClock
 from event_discovery.ingest.budget import QuotaBudget, RatePacer
 from event_discovery.ingest.client import DiscoveryClient
 from event_discovery.ingest.planner import load_regions
-from event_discovery.ingest.worker import EventSink, IngestWorker, InMemorySink
+from event_discovery.ingest.resilience import CircuitBreaker, Retrier
+from event_discovery.ingest.worker import (
+    EventSink,
+    IngestWorker,
+    InMemorySink,
+    StateStore,
+    seconds_to_next_cycle,
+)
 from event_discovery.storage.db import migrate, open_pool
 from event_discovery.storage.events import PostgresSink
+from event_discovery.storage.regions import PostgresStateStore
 from event_discovery.upstream_sim.app import create_app
 from event_discovery.upstream_sim.dataset import generate_events
 
@@ -89,13 +97,30 @@ def _run_ingest(args: argparse.Namespace) -> None:
     budget = QuotaBudget(clock, daily_limit=args.quota, reserve=args.reserve)
     pool = open_pool(args.database_url) if args.database_url else None
     sink: EventSink = InMemorySink()
+    state_store: StateStore | None = None
     if pool is not None:
         migrate(pool)
         sink = PostgresSink(pool)
+        state_store = PostgresStateStore(pool)
+    breaker = CircuitBreaker(clock)
     try:
         with httpx.Client(base_url=args.base_url, timeout=10.0) as http:
-            client = DiscoveryClient(http, args.api_key, RatePacer(clock, args.rate), budget)
-            worker = IngestWorker(client, sink, load_regions(args.regions), clock, budget=budget)
+            client = DiscoveryClient(
+                http,
+                args.api_key,
+                RatePacer(clock, args.rate),
+                budget,
+                retrier=Retrier(clock),
+                breaker=breaker,
+            )
+            worker = IngestWorker(
+                client,
+                sink,
+                load_regions(args.regions),
+                clock,
+                budget=budget,
+                state_store=state_store,
+            )
             cycle = 0
             while args.cycles == 0 or cycle < args.cycles:
                 started = clock.now()
@@ -105,7 +130,10 @@ def _run_ingest(args: argparse.Namespace) -> None:
                 )
                 cycle += 1
                 if args.cycles == 0 or cycle < args.cycles:
-                    clock.sleep(max(0.0, args.interval - (clock.now() - started)))
+                    wait = seconds_to_next_cycle(report, args.interval, breaker, clock.now())
+                    if wait == args.interval:
+                        wait = max(0.0, args.interval - (clock.now() - started))
+                    clock.sleep(wait)
     finally:
         if pool is not None:
             pool.close()

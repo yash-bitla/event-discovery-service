@@ -3,6 +3,9 @@
 It copies the limits that Ticketmaster documents: a daily quota, a per-second rate
 limit, the `Rate-Limit-*` response headers, the 429 fault body, and the deep paging
 limit (`size * page < 1000`). The events are synthetic.
+
+`PUT /_sim/faults` makes the upstream fail on command. A call that fails in this
+way uses the quota, because the limits run before the fault.
 """
 
 from __future__ import annotations
@@ -12,14 +15,15 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from event_discovery.clock import Clock
 from event_discovery.geo import geohash_decode, haversine_km
 from event_discovery.upstream_sim.dataset import SimEvent
+from event_discovery.upstream_sim.faults import FaultInjector, FaultPlan
 from event_discovery.upstream_sim.limits import Decision, RateLimiter, Verdict
 
 MAX_PAGE_SIZE = 200
@@ -77,9 +81,11 @@ def create_app(
     api_keys: Sequence[str] = ("demo",),
     daily_quota: int = 5000,
     per_second: int = 5,
+    fault_seed: int = 0,
 ) -> FastAPI:
     app = FastAPI(title="Simulated Discovery API", docs_url=None, redoc_url=None)
     limiter = RateLimiter(clock, daily_quota=daily_quota, per_second=per_second)
+    faults = FaultInjector(clock, seed=fault_seed)
     index = _EventIndex(events)
     valid_keys = frozenset(api_keys)
     cache: OrderedDict[tuple[str, ...], list[SimEvent]] = OrderedDict()
@@ -137,6 +143,14 @@ def create_app(
                 headers,
             )
 
+        if faults.should_fail():
+            return _fault(
+                503,
+                "The Service is temporarily unavailable",
+                "messaging.adaptors.http.flow.ServiceUnavailable",
+                headers,
+            )
+
         try:
             size = _parse_int(params, "size", default=20, minimum=1)
             page = _parse_int(params, "page", default=0, minimum=0)
@@ -167,7 +181,16 @@ def create_app(
     @app.get("/_sim/stats")
     def stats() -> dict[str, int]:
         """Counts of the calls that the limits accepted and rejected. Not a Discovery route."""
-        return asdict(limiter.stats)
+        return {**asdict(limiter.stats), "faults_injected": faults.injected}
+
+    @app.put("/_sim/faults")
+    def set_faults(body: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+        """Replace the fault plan. An empty object removes all faults."""
+        try:
+            faults.plan = FaultPlan.from_json(body)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(422, str(error)) from error
+        return asdict(faults.plan)
 
     return app
 

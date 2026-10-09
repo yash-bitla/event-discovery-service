@@ -9,9 +9,11 @@ from event_discovery.api.app import create_api
 from event_discovery.clock import ManualClock
 from event_discovery.ingest.budget import RatePacer
 from event_discovery.ingest.client import DiscoveryClient
-from event_discovery.ingest.planner import Region
+from event_discovery.ingest.planner import Region, RegionState
+from event_discovery.ingest.resilience import CircuitBreaker, Retrier
 from event_discovery.ingest.worker import IngestWorker
 from event_discovery.storage.events import PostgresSink
+from event_discovery.storage.regions import PostgresStateStore
 from event_discovery.upstream_sim.dataset import SimEvent
 from test_storage import event
 
@@ -30,6 +32,7 @@ def test_events_returns_the_events_near_the_point(api: TestClient, pool: Connect
 
     assert [e["id"] for e in body["events"]] == ["near"]
     assert body["next_cursor"] is None
+    assert body["refreshed_at"] is None  # no region has a refresh yet
     assert body["events"][0] == {
         "id": "near",
         "name": "Event near",
@@ -116,3 +119,43 @@ def test_ingested_events_are_in_the_api(
     assert report.events_new > 0
     assert len(body["events"]) == min(report.events_new, 200)
     assert {e["city"] for e in body["events"]} == {"Boston"}
+
+
+def test_the_api_answers_from_stored_data_while_the_upstream_is_not_available(
+    api: TestClient, pool: ConnectionPool, events: list[SimEvent], clock: ManualClock
+) -> None:
+    boston = Region("Boston", 42.3601, -71.0589, 50, 1.0)
+    sim = make_sim(events, clock)
+    breaker = CircuitBreaker(clock)
+    client = DiscoveryClient(
+        sim, "demo", RatePacer(clock, 4), retrier=Retrier(clock, seed=1), breaker=breaker
+    )
+    worker = IngestWorker(
+        client, PostgresSink(pool), [boston], clock, state_store=PostgresStateStore(pool)
+    )
+    params = {"lat": 42.3601, "lon": -71.0589, "radius_km": 30, "end": "2026-04-02T00:00:00Z"}
+
+    assert worker.run_cycle(3600).refreshed == 1
+    before = api.get("/events", params=params).json()
+    assert before["refreshed_at"] == "2026-01-01T00:00:00Z"
+    assert len(before["events"]) == 50
+
+    clock.advance_to(BASE.timestamp() + 3600)
+    sim.put("/_sim/faults", json={"outages": [[clock.now(), clock.now() + 7200]]})
+    report = worker.run_cycle(3600)
+    assert (report.refreshed, report.failed) == (0, 1)
+
+    during = api.get("/events", params=params)
+    assert during.status_code == 200
+    assert during.json() == before  # the same events, and the same refresh time
+
+
+def test_refreshed_at_is_null_for_a_point_outside_all_regions(
+    api: TestClient, pool: ConnectionPool
+) -> None:
+    boston = Region("Boston", 42.3601, -71.0589, 50, 1.0)
+    PostgresStateStore(pool).save(boston, RegionState(last_refreshed_at=BASE.timestamp()))
+    inside = api.get("/events", params={"lat": 42.4, "lon": -71.1}).json()
+    outside = api.get("/events", params=NEW_YORK).json()
+    assert inside["refreshed_at"] == "2026-01-01T00:00:00Z"
+    assert outside["refreshed_at"] is None

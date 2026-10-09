@@ -8,9 +8,11 @@ from psycopg_pool import ConnectionPool
 
 from conftest import BASE
 from event_discovery.geo import haversine_km
+from event_discovery.ingest.planner import Region, RegionState
 from event_discovery.models import Event
 from event_discovery.storage.db import migrate
 from event_discovery.storage.events import PostgresSink, SearchQuery, search_events
+from event_discovery.storage.regions import PostgresStateStore, last_refresh
 from event_discovery.upstream_sim.dataset import SimEvent
 
 NEW_YORK = (40.7128, -74.0060)
@@ -168,3 +170,19 @@ def test_the_search_uses_the_index(pool: ConnectionPool, events: list[SimEvent])
             """
         ).fetchall()
     assert "events_location_time_idx" in "\n".join(row[0] for row in plan)
+
+
+def test_the_state_store_returns_what_it_saved(pool: ConnectionPool) -> None:
+    store = PostgresStateStore(pool)
+    boston = Region("Boston", 42.3601, -71.0589, 50, 1.0)
+    denver = Region("Denver", 39.7392, -104.9903, 50, 1.0)
+    store.save(boston, RegionState(last_refreshed_at=BASE.timestamp(), expected_cost=7))
+    store.save(denver, RegionState())
+    store.save(boston, RegionState(last_refreshed_at=BASE.timestamp() + 60, expected_cost=9))
+
+    assert store.load() == {
+        "Boston": RegionState(last_refreshed_at=BASE.timestamp() + 60, expected_cost=9),
+        "Denver": RegionState(),
+    }
+    assert last_refresh(pool, 42.4, -71.1) == BASE + timedelta(seconds=60)
+    assert last_refresh(pool, 39.7, -105.0) is None  # Denver has no refresh yet
